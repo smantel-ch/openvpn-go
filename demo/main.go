@@ -29,7 +29,7 @@ func main() {
 
 	if *debug {
 		logger, _ := zap.NewDevelopment()
-		openvpn.SetLogger(logger.Sugar())
+		openvpn.SetLogger(logger.Sugar().With(zap.String("module", "vpnClient")))
 	}
 
 	configData, err := os.ReadFile(*configPath)
@@ -37,10 +37,13 @@ func main() {
 		log.Fatalf("Failed to read config: %v", err)
 	}
 
-	client, err := openvpn.NewVPNClient(configData, *username, *password)
+	client, err := openvpn.NewVPNClient()
 	if err != nil {
 		log.Fatalf("Failed to initialize VPN client: %v", err)
 	}
+
+	client.SetConfig(configData)
+	client.SetCredentials(*username, *password)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeout)*time.Second)
 	defer cancel()
@@ -55,12 +58,6 @@ func main() {
 			log.Fatalf("Unexpected VPN error: %v", err)
 		}
 	}
-
-	go func() {
-		for logLine := range client.LogsChan() {
-			fmt.Println("[VPN LOG]", logLine)
-		}
-	}()
 
 	fmt.Printf("Connected! Status: %s\n", client.Status())
 	fmt.Println("Sleeping for 5 seconds...")
