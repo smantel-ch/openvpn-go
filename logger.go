@@ -1,11 +1,11 @@
 package openvpn
 
 type Logger interface {
-	Debugf(format string, args ...interface{})
+	Debugf(format string, args ...any)
 }
 
-var moduleLogger Logger = nil
+var logger Logger = nil
 
 func SetLogger(l Logger) {
-	moduleLogger = l
+	logger = l
 }
