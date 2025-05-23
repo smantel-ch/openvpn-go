@@ -2,6 +2,7 @@ package openvpn
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"sync"
 	"time"
@@ -27,6 +28,7 @@ type VPNClient struct {
 	currentStatus VPNStatus
 	logsBuffer    []string
 	closed        bool
+	lastErrorLine string
 }
 
 func NewVPNClient(config []byte, username, password string) (*VPNClient, error) {
@@ -45,31 +47,41 @@ func NewVPNClient(config []byte, username, password string) (*VPNClient, error) 
 }
 
 func (vc *VPNClient) Connect(ctx context.Context) error {
+	if pids, err := killLingeringOpenVPN(); err != nil {
+		return fmt.Errorf("%w: could not terminate OpenVPN process(es) with PID(s): %v — %v", ErrZombieProcess, pids, err)
+	}
+
 	vc.processLock.Lock()
-	defer vc.processLock.Unlock()
 
 	if vc.running {
+		vc.processLock.Unlock()
 		return ErrAlreadyRunning
 	}
 
 	if err := vc.prepareFiles(); err != nil {
+		vc.processLock.Unlock()
 		return err
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	vc.cancel = cancel
 
-	cmd := exec.CommandContext(ctx, "openvpn", "--config", vc.configPath, "--auth-user-pass", vc.authPath)
+	cmd := exec.CommandContext(ctx, "openvpn", "--config", vc.configPath, "--auth-user-pass", vc.authPath, "--auth-nocache")
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		vc.processLock.Unlock()
 		return err
 	}
+
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		vc.processLock.Unlock()
 		return err
 	}
 
 	if err := cmd.Start(); err != nil {
+		vc.processLock.Unlock()
 		return err
 	}
 
@@ -79,6 +91,9 @@ func (vc *VPNClient) Connect(ctx context.Context) error {
 
 	go vc.pipeOutput(stdout)
 	go vc.pipeOutput(stderr)
+
+	vc.processLock.Unlock()
+
 	go vc.monitor()
 
 	result := make(chan error, 1)
@@ -99,6 +114,37 @@ func (vc *VPNClient) Disconnect() error {
 	vc.running = false
 	vc.cleanup()
 	return nil
+}
+
+func (vc *VPNClient) DisconnectAndWait(ctx context.Context) error {
+	if err := vc.Disconnect(); err != nil {
+		return err
+	}
+
+	for {
+		select {
+		case s, ok := <-vc.StatusChan():
+			if !ok {
+				fmt.Println("[DEBUG] Status channel closed, checking currentStatus...")
+				if vc.Status() == StatusDisconnected || vc.Status() == StatusError {
+					return nil
+				}
+				return ErrConnectionFailed
+			}
+			fmt.Println("[DEBUG] Received status:", s)
+			if s == StatusDisconnected || s == StatusError {
+				return nil
+			}
+		case err := <-vc.ErrorsChan():
+			if err != nil {
+				fmt.Println("[DEBUG] Received error:", err)
+				return err
+			}
+		case <-ctx.Done():
+			fmt.Println("[DEBUG] Disconnect context timed out")
+			return ctx.Err()
+		}
+	}
 }
 
 func (vc *VPNClient) Reconnect(ctx context.Context) error {
