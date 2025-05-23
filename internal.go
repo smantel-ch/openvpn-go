@@ -18,34 +18,12 @@ func (vc *VPNClient) waitForConnection(ctx context.Context, result chan error) {
 				result <- nil
 				return
 			} else if s == StatusError || s == StatusDisconnected {
-				if vc.lastErrorLine != "" {
-					result <- VPNError{
-						Code:    ErrConnectionFailed,
-						Message: vc.lastErrorLine,
-					}
-				} else {
-					result <- VPNError{
-						Code:    ErrConnectionFailed,
-						Message: "VPN disconnected unexpectedly",
-					}
-				}
+				result <- ErrConnectionFailed
 				return
 			}
-
 		case err := <-vc.errors:
-			if vc.lastErrorLine != "" {
-				result <- VPNError{
-					Code:    ErrConnectionFailed,
-					Message: vc.lastErrorLine,
-				}
-			} else {
-				result <- VPNError{
-					Code:    ErrConnectionFailed,
-					Message: fmt.Sprintf("OpenVPN exited with error: %v", err),
-				}
-			}
+			result <- err
 			return
-
 		case <-ctx.Done():
 			_ = vc.Disconnect()
 			_ = vc.forceKillIfStillRunning()
@@ -90,8 +68,12 @@ func (vc *VPNClient) pipeOutput(r io.ReadCloser) {
 		line := scanner.Text()
 		vc.sendLog(line)
 
-		if msg := detectLogError(line); msg != "" {
-			vc.lastErrorLine = msg
+		if logger != nil {
+			logger.Debugf(line)
+		}
+
+		if err := detectLogError(line); err != nil {
+			vc.lastErrorLine = err.Error()
 		}
 
 		if strings.Contains(line, "Initialization Sequence Completed") {
@@ -108,7 +90,6 @@ func (vc *VPNClient) monitor() {
 
 	if err != nil {
 		vc.sendStatus(StatusError)
-
 		if vc.lastErrorLine != "" {
 			vc.sendError(fmt.Errorf("%w: %s", ErrConnectionFailed, vc.lastErrorLine))
 		} else {
@@ -146,7 +127,6 @@ func (vc *VPNClient) cleanupTempFiles() {
 func (vc *VPNClient) sendLog(log string) {
 	vc.logsBuffer = append(vc.logsBuffer, log)
 	defer func() { _ = recover() }()
-
 	select {
 	case vc.logs <- log:
 	default:
@@ -156,7 +136,6 @@ func (vc *VPNClient) sendLog(log string) {
 func (vc *VPNClient) sendStatus(s VPNStatus) {
 	vc.currentStatus = s
 	defer func() { _ = recover() }()
-
 	select {
 	case vc.status <- s:
 	default:
@@ -164,11 +143,7 @@ func (vc *VPNClient) sendStatus(s VPNStatus) {
 }
 
 func (vc *VPNClient) sendError(err error) {
-	if err == nil {
-		return
-	}
 	defer func() { _ = recover() }()
-
 	select {
 	case vc.errors <- err:
 	default:
@@ -176,35 +151,28 @@ func (vc *VPNClient) sendError(err error) {
 }
 
 func (vc *VPNClient) forceKillIfStillRunning() error {
-	vc.processLock.Lock()
-	defer vc.processLock.Unlock()
-
-	if vc.cmd != nil && vc.running {
-		_ = vc.cmd.Process.Kill()
-		vc.running = false
+	if vc.cmd != nil && vc.cmd.Process != nil {
+		return vc.cmd.Process.Kill()
 	}
 	return nil
 }
 
-func findOpenVPNPIDs() ([]string, error) {
-	out, err := exec.Command("pgrep", "-f", "openvpn").Output()
+func killLingeringOpenVPN() ([]int, error) {
+	out, err := exec.Command("pgrep", "openvpn").Output()
 	if err != nil {
-		return nil, err
+		return nil, nil // No lingering processes found
 	}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	return lines, nil
+	var pids []int
+	for _, line := range lines {
+		pids = append(pids, parsePID(line))
+	}
+	err = exec.Command("pkill", "-f", "openvpn").Run()
+	return pids, err
 }
 
-func killLingeringOpenVPN() ([]string, error) {
-	pids, err := findOpenVPNPIDs()
-	if err != nil || len(pids) == 0 {
-		return nil, nil // Nothing running
-	}
-
-	// Try to kill them
-	cmd := exec.Command("pkill", "-f", "openvpn")
-	if err := cmd.Run(); err != nil {
-		return pids, err
-	}
-	return pids, nil
+func parsePID(pidStr string) int {
+	var pid int
+	fmt.Sscanf(pidStr, "%d", &pid)
+	return pid
 }
